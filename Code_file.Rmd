@@ -1,0 +1,1227 @@
+---
+title: "37651064"
+output:
+  pdf_document: default
+  html_notebook: default
+---
+
+
+```{r}
+library(tidyverse)
+library(tidytext)
+library(textdata)
+library(tm)
+library(caret)
+library(stringr)
+library(wordcloud)
+library(widyr)
+library(topicmodels)
+library(rpart)
+library(randomForest)
+library(xgboost)
+library(arules)
+library(arulesViz)
+library(pROC)
+library(cluster)
+
+
+raw_data <- read_csv("journal_data_CW4.csv")
+#nrow(raw_data)
+raw_data <- distinct(raw_data)
+#nrow(raw_data)
+#row number doesn't change after selecting distinct rows so no need to re-number the docs
+
+```
+
+
+```{r}
+#tokenize abstracts
+
+tidy_data <- raw_data %>% 
+  select(doc_number, journal, year, abstract) %>% 
+  unnest_tokens(word, abstract) %>%
+  filter(str_detect(word, "^[a-z]+$"))       #this was added after the initial pre-processing as it only became an issue in a later task, so is redefined a few time later'
+
+
+#checking top words
+
+#slice_head(tidy_data %>% 
+#             count(word) %>% 
+#             arrange(desc(n)), n = 10)
+
+#load and exclude stop words
+
+data("stop_words")
+
+tidy_data <- tidy_data %>% 
+  anti_join(stop_words, by = "word") %>%
+  filter(!str_detect(word, "\\b\\d+\\b"))
+
+slice_head(tidy_data %>% 
+             count(word) %>% 
+             arrange(desc(n)),n=20)
+
+# custom stop words from inspection (justified in report)
+
+custom_stop_words <- c("method", "methods","paper", "model","models",  "results", "based", "proposed", "study", "approach","analysis","data")
+
+tidy_data <- tidy_data %>% 
+  filter(!word %in% custom_stop_words)
+
+slice_head(tidy_data %>% 
+             count(word) %>% 
+             arrange(desc(n)),n=20)
+
+
+```
+
+
+
+```{r}
+#word cloud
+top_words <- tidy_data %>%
+  count(word, sort = TRUE) %>%
+  slice_head(n = 40)
+
+with(top_words,
+     wordcloud(word, n, random.order = FALSE, scale = c(3, 0.8))
+)
+
+```
+
+
+```{r}
+# word pairs
+
+top_words <- tidy_data %>%
+  count(word, sort = TRUE) %>%
+  slice_head(n = 50) %>%
+  pull(word)
+
+pairs <- tidy_data %>%
+  filter(word %in% top_words) %>%
+  pairwise_count(item = word, feature = doc_number, sort = TRUE)
+
+pairs %>%
+  slice_head(n = 25) %>%
+  ggplot(aes(x = n, y = reorder(paste(item1, item2, sep=" - "), n))) +
+  geom_col() +
+  labs(
+    title = "Most common word pairs",
+    x = "Number of documents containing both words",
+    y = NULL
+  ) +
+  theme_minimal()
+
+
+```
+```{r}
+
+#word freq by journal
+
+top_words_journal <- tidy_data %>% 
+  count(journal, word, sort = TRUE) %>%
+  group_by(journal) %>% 
+  slice_max(n, n = 10, with_ties = FALSE) %>%
+  ungroup()
+
+top_words_journal %>%
+  ggplot(aes(x = n, y = reorder_within(word, n, journal))) +
+  geom_col(fill = "steelblue") +
+  facet_wrap(~ journal, scales = "free") +
+  scale_y_reordered() +
+  labs(
+    title = "Top 10 most frequent words by journal",
+    x = "Word frequency",
+    y = NULL
+  )
+top_words_journal
+```
+
+
+```{r}
+
+# tf-idf by journal
+
+journal_tf_idf <- tidy_data %>% 
+  count(journal, word, sort = TRUE) %>%
+  bind_tf_idf(term = word, document = journal, n = n)
+
+journal_tf_idf %>% 
+  group_by(journal) %>%
+  slice_max(tf_idf, n = 10) %>%
+  ungroup() %>%
+  ggplot(aes(x = tf_idf, y = reorder_within(word, tf_idf, journal))) + 
+  geom_col(fill = "navy") +
+  facet_wrap(~ journal, scales = "free") +
+  scale_y_reordered() +
+  labs(
+    title = "Top 10 TF-IDF words by journal",
+    x = "TF-IDF",
+    y = NULL
+  )
+```
+```{r}
+#LDA topic modeling
+
+abstract_words <- tidy_data %>%
+  count(doc_number, word, sort = TRUE)
+
+abstract_dtm <- abstract_words %>%
+  cast_dtm(doc_number, word, n)
+
+abstract_lda <- LDA(abstract_dtm, k = 5, control = list(seed = 10))
+abstract_topics <- tidy(abstract_lda, matrix = "beta")
+abstract_gamma <- tidy(abstract_lda, matrix = "gamma")
+
+
+top_terms <- abstract_topics %>%
+  group_by(topic) %>%
+  slice_max(beta, n = 15, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(term = reorder_within(term, beta, topic))
+
+ggplot(top_terms, aes(x = term, y = beta, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  facet_wrap(~ topic, scales = "free") +
+  scale_x_reordered() +
+  labs(
+    title = "Top terms per topic (LDA)",
+    x = NULL,
+    y = "Beta"
+    + theme(
+    plot.margin = ggplot2::margin(t = 20, r = 10, b = 10, l = 10))
+  ) 
+```
+
+
+
+```{r}
+# topic distribution by journal
+
+gamma_journal <- abstract_gamma %>%
+  mutate(document = as.integer(document)) %>%
+  left_join(
+    raw_data %>%
+      select(doc_number, journal) %>%
+      distinct(),
+    by = c("document" = "doc_number")
+  )
+
+
+top_topic <- gamma_journal %>%
+  group_by(document) %>%
+  slice_max(gamma, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+# plot dominant topic share by journal
+ggplot(top_topic, aes(x = journal, fill = factor(topic))) +
+  geom_bar(position = "fill") +
+  labs(
+    title = "Topic distribution by journal",
+    x = "Journal",
+    y = "Proportion of documents",
+    fill = "Topic"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+```
+
+
+
+```{r}
+#classification
+
+#setup train/test sets
+
+labels <- raw_data %>% 
+  select(doc_number, journal) %>%
+  distinct() %>%
+  mutate(
+    doc_number = as.integer(doc_number), 
+    journal = as.factor(journal)
+  )
+
+set.seed(10)
+idx_train <- createDataPartition(labels$journal, p = 0.7, list = FALSE)
+
+train_ids <- labels$doc_number[idx_train]
+test_ids <- labels$doc_number[-idx_train]
+
+y_train <- labels$journal[idx_train]
+y_test <- labels$journal[-idx_train]
+```
+
+```{r}
+#BOW classification
+
+max_words <- 1500
+
+selected_words <- tidy_data %>%
+  count(word, sort = TRUE) %>%
+  slice_head(n = max_words) %>%
+  pull(word)
+
+X_sparse <- tidy_data %>%
+  filter(word %in% selected_words) %>%
+  count(doc_number, word) %>%
+  cast_sparse(doc_number, word, n)
+
+train_rows <- as.character(train_ids)
+test_rows <- as.character(test_ids)
+
+X_bow_train <- as.matrix(X_sparse[train_rows, , drop = FALSE])
+X_bow_test <- as.matrix(X_sparse[test_rows, , drop = FALSE])
+
+colnames(X_bow_train) <- make.names(colnames(X_bow_train))
+colnames(X_bow_test) <- make.names(colnames(X_bow_test))
+
+bow_trainset <- data.frame(journal = y_train, X_bow_train)
+bow_test_x <- data.frame(X_bow_test)
+
+pred_cols <- setdiff(names(bow_trainset), "journal")
+missing_cols <- setdiff(pred_cols, names(bow_test_x))
+
+if (length(missing_cols) > 0) {
+  bow_test_x[missing_cols] <- 0
+}
+
+bow_test_x <- bow_test_x[, pred_cols, drop = FALSE]
+```
+
+```{r}
+#random forest -BOW
+set.seed(10)
+
+bow_rf <- randomForest(
+  journal ~ .,
+  data = bow_trainset,
+  ntree = 100,
+  mtry = floor(sqrt(ncol(X_bow_train)))
+)
+
+pred_bow_rf <- predict(bow_rf, newdata = bow_test_x)
+cm_bow_rf <- confusionMatrix(pred_bow_rf, y_test)
+cm_bow_rf
+
+```
+```{r}
+#XGboost - BOW
+
+pred_cols <- setdiff(names(bow_trainset), "journal")
+
+missing_cols <- setdiff(pred_cols, names(bow_test_x))
+if (length(missing_cols) > 0) bow_test_x[missing_cols] <- 0
+bow_test_x <- bow_test_x[, pred_cols, drop = FALSE]
+
+xg_train <- as.matrix(bow_trainset[, pred_cols, drop = FALSE])
+xg_test <- as.matrix(bow_test_x)
+
+xg_train_label <- as.integer(y_train) - 1
+xg_test_label <- as.integer(y_test) - 1
+
+set.seed(10)
+
+bow_xg <- xgboost(
+  data = xg_train, 
+  label = xg_train_label,
+  max.depth = 3,
+  nrounds = 300,
+  eta = 0.3,
+  objective = "multi:softmax",
+  num_class = length(levels(y_train)),
+  verbose = 0
+)
+
+pred_bow_xg <- predict(bow_xg, xg_test)
+pred_bow_xg <- factor(
+  levels(y_train)[pred_bow_xg + 1],
+  levels = levels(y_train)
+)
+
+cm_bow_xg <- confusionMatrix(pred_bow_xg, y_test)
+cm_bow_xg
+```
+
+```{r}
+#XGboost - tf-idf
+
+X_tf_idf <- tidy_data %>%
+  filter(word %in% selected_words) %>%
+  count(doc_number, word) %>%
+  bind_tf_idf(term = word, document = doc_number, n = n) %>%
+  select(doc_number, word, tf_idf) %>%
+  pivot_wider(names_from = word, values_from = tf_idf, values_fill = 0)
+
+X_tf_idf_train <- X_tf_idf %>%
+  filter(doc_number %in% train_ids) %>%
+  arrange(doc_number) %>%
+  select(-doc_number)
+
+X_tf_idf_test <- X_tf_idf %>%
+  filter(doc_number %in% test_ids) %>%
+  arrange(doc_number) %>%
+  select(-doc_number)
+
+xg_train <- as.matrix(X_tf_idf_train)
+xg_test <- as.matrix(X_tf_idf_test)
+
+train_label <- as.integer(y_train) - 1
+
+set.seed(10)
+
+tf_idf_xg <- xgboost(
+  data = xg_train, 
+  label = train_label,
+  max.depth = 3,
+  nrounds = 300,
+  eta = 0.3,
+  objective = "multi:softmax",
+  num_class = length(levels(y_train)),
+  verbose = 0
+)
+
+pred_tf_idf_xg <- predict(tf_idf_xg, xg_test)
+pred_tf_idf_xg <- factor(
+  levels(y_train)[pred_tf_idf_xg + 1], 
+  levels = levels(y_train)
+)
+
+cm_tf_idf_xg <- confusionMatrix(pred_tf_idf_xg, y_test)
+cm_tf_idf_xg
+```
+
+```{r}
+#XGboost - topic distribution
+
+X_topic <- abstract_gamma %>%
+  mutate(
+    document = as.integer(document),
+    topic = paste0("topic_", topic)
+  ) %>%
+  select(document, topic, gamma) %>%
+  pivot_wider(names_from = topic, values_from = gamma, values_fill = 0) %>%
+  rename(doc_number = document)
+
+X_topic_train <- X_topic %>%
+  filter(doc_number %in% train_ids) %>%
+  arrange(doc_number) %>%
+  select(-doc_number)
+
+X_topic_test <- X_topic %>%
+  filter(doc_number %in% test_ids) %>%
+  arrange(doc_number) %>%
+  select(-doc_number)
+
+xg_train <- as.matrix(X_topic_train)
+xg_test <- as.matrix(X_topic_test)
+
+train_label <- as.integer(y_train) - 1
+
+set.seed(10)
+
+topic_xg <- xgboost(
+  data = xg_train, 
+  label = train_label,
+  max.depth = 3,
+  nrounds = 500,
+  eta = 0.2,
+  objective = "multi:softmax",
+  num_class = length(levels(y_train)),
+  verbose = 0
+)
+
+pred_topic_xg <- predict(topic_xg, xg_test)
+pred_topic_xg <- factor(
+  levels(y_train)[pred_topic_xg + 1], 
+  levels = levels(y_train)
+)
+
+cm_topic_xg <- confusionMatrix(pred_topic_xg, y_test)
+cm_topic_xg
+```
+```{r}
+
+results_tbl <- tibble(
+  Representation = c("BOW", "BOW", "TF-IDF", "Topics"),
+  Model = c("RF", "XGBoost", "XGBoost", "XGBoost"),
+  Accuracy = c(
+    cm_bow_rf$overall[["Accuracy"]],
+    cm_bow_xg$overall[["Accuracy"]],
+    cm_tf_idf_xg$overall[["Accuracy"]],
+    cm_topic_xg$overall[["Accuracy"]]
+  ),
+  Kappa = c(
+    cm_bow_rf$overall[["Kappa"]],
+    cm_bow_xg$overall[["Kappa"]],
+    cm_tf_idf_xg$overall[["Kappa"]],
+    cm_topic_xg$overall[["Kappa"]]
+  )
+) %>%
+  mutate(
+    Accuracy = as.numeric(Accuracy),
+    Kappa = as.numeric(Kappa)
+  )
+
+results_tbl
+
+```
+
+```{r}
+# association
+
+#transactions per journal
+
+min_freq <- 25
+
+journals <- raw_data %>%
+  distinct(journal) %>%
+  arrange(journal) %>%
+  pull(journal)
+
+tokens_list <- vector("list", length(journals))
+transactions_list <- vector("list", length(journals))
+
+for (j in seq_along(journals)) {
+
+  tokens <- raw_data %>%
+    filter(journal == journals[j]) %>%
+    select(doc_number, abstract) %>%
+    mutate(doc_number = as.integer(doc_number)) %>%
+    unnest_tokens(word, abstract) %>%
+    anti_join(stop_words, by = "word") %>%
+    filter(!word %in% custom_stop_words) %>%
+    filter(str_detect(word, "^[a-z]+$")) %>%
+    filter(!str_detect(word, "\\b\\d+\\b"))
+
+  keep_words <- tokens %>%
+    count(word) %>%
+    filter(n >= min_freq) %>%
+    pull(word)
+
+  tokens <- tokens %>%
+    filter(word %in% keep_words)
+
+  tokens_list[[j]] <- tokens
+
+  transactions_list[[j]] <- tokens %>%
+    distinct(doc_number, word) %>%
+    split(.$doc_number) %>%
+    lapply(function(x) x$word) %>%
+    as("transactions")
+}
+
+summary_df <- tibble(
+  journal = journals,
+  n_docs = sapply(tokens_list, function(x) n_distinct(x$doc_number)),
+  n_words = sapply(tokens_list, function(x) n_distinct(x$word)),
+  n_transactions = sapply(transactions_list, length)
+)
+
+summary_df
+
+```
+
+```{r}
+min_support <- 0.01
+min_conf <- 0.4
+
+rules_list <- vector("list", 4)
+
+for (j in 1:4) {
+  
+  rules <- apriori(
+    transactions_list[[j]],
+    parameter = list(
+      supp = min_support,
+      conf = min_conf,
+      minlen = 2
+    )
+  )
+  
+  rules <- subset(rules, lift > 1.0)
+  rules <- sort(rules, by = "lift", decreasing = TRUE)
+  
+  rules_list[[j]] <- rules
+}
+
+rules_summary <- tibble(
+  journal = 1:4,
+  n_rules = sapply(rules_list, length)
+)
+
+rules_summary
+```
+
+```{r}
+# visualisations
+
+n_rules <- 15
+
+for (j in 1:4) {
+
+  rules_sorted <- sort(rules_list[[j]], by = "lift", decreasing = TRUE)
+  rules_sub <- rules_sorted[1:min(n_rules, length(rules_sorted))]
+
+  p <- plot(
+    rules_sub,
+    method  = "graph",
+    measure = "lift",
+    shading = "confidence"
+  )
+
+  # add title
+  if (inherits(p, "ggplot")) {
+    print(p + ggplot2::ggtitle(
+      paste("Journal", j, "- top", n_rules, "association rules")
+    ))
+  } else {
+    title(
+      main = paste("Journal", j, "- top", n_rules, "association rules"),
+      cex.main = 0.9
+    )
+  }
+}
+
+
+```
+
+
+```{r}
+#topic dist over time
+
+topic_year <- abstract_gamma %>%
+  mutate(doc_number = as.integer(document)) %>%
+  left_join(
+    raw_data %>% select(doc_number, year),
+    by = "doc_number"
+  ) %>%
+  group_by(year, topic) %>%
+  summarise(mean_gamma = mean(gamma), .groups = "drop") %>%
+  arrange(year)
+
+ggplot(topic_year, aes(x = year, y = mean_gamma, color = factor(topic))) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 1.5) +
+  labs(
+    title = "Average topic distribution over time",
+    x = "Year",
+    y = "Mean topic probability",
+    color = "Topic"
+  ) +
+  theme_minimal()
+
+ggplot(topic_year, aes(x = year, y = factor(topic), fill = mean_gamma)) +
+  geom_tile() +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  labs(
+    title = "Topic distribution by year (heatmap)",
+    x = "Year",
+    y = "Topic",
+    fill = "Mean γ"
+  ) +
+  theme_minimal()
+```
+
+
+
+```{r}
+#hierarchical clustering - idf
+
+year_tf_idf <- tidy_data %>%
+  count(year, word) %>%
+  bind_tf_idf(term = word, document = year, n = n) %>%
+  select(year, word, tf_idf)
+
+top_words_year <- year_tf_idf %>%
+  group_by(word) %>%
+  summarise(mean_tf_idf = mean(tf_idf)) %>%
+  slice_max(mean_tf_idf, n = 500) %>%
+  pull(word)
+
+year_mat <- year_tf_idf %>%
+  filter(word %in% top_words_year) %>%
+  pivot_wider(names_from = word, values_from = tf_idf, values_fill = 0) %>%
+  arrange(year)
+
+year_labels <- year_mat$year
+X_year <- as.matrix(year_mat[, -1])
+rownames(X_year) <- year_labels
+
+d_year <- dist(X_year, method = "euclidean")
+hc_year <- hclust(d_year, method = "ward.D2")
+
+plot(hc_year, main = "Hierarchical clustering of years (TF-IDF, euclidean)")
+```
+
+
+
+```{r}
+# pre vs post 2015 classification
+
+labels_time <- raw_data %>%
+  select(doc_number, year) %>%
+  distinct() %>%
+  mutate(
+    doc_number = as.integer(doc_number),
+    period = ifelse(year < 2015, "pre", "post"),
+    period = as.factor(period)
+  )
+
+set.seed(10)
+idx_train_time <- createDataPartition(labels_time$period, p = 0.7, list = FALSE)
+
+train_ids_time <- labels_time$doc_number[idx_train_time]
+test_ids_time <- labels_time$doc_number[-idx_train_time]
+y_train_time <- labels_time$period[idx_train_time]
+y_test_time <- labels_time$period[-idx_train_time]
+
+```
+
+```{r}
+tidy_time <- raw_data %>%
+  select(doc_number, abstract) %>%
+  unnest_tokens(word, abstract) %>%
+  anti_join(stop_words, by = "word") %>%
+  filter(!word %in% custom_stop_words) %>%
+  filter(str_detect(word, "^[a-z]+$"))
+
+max_words_time <- 1500
+
+selected_words_time <- tidy_time %>%
+  count(word, sort = TRUE) %>%
+  slice_head(n = max_words_time) %>%
+  pull(word)
+
+```
+
+```{r}
+X_tf_idf_time <- tidy_time %>%
+  filter(word %in% selected_words_time) %>%
+  count(doc_number, word) %>%
+  bind_tf_idf(term = word, document = doc_number, n = n) %>%
+  select(doc_number, word, tf_idf) %>%
+  pivot_wider(names_from = word, values_from = tf_idf, values_fill = 0)
+
+docs_time <- tibble(doc_number = sort(unique(c(train_ids_time, test_ids_time))))
+
+X_tf_idf_full <- docs_time %>%
+  left_join(X_tf_idf_time, by = "doc_number") %>%
+  mutate(across(-doc_number, ~ replace_na(.x, 0))) %>%
+  arrange(doc_number)
+
+X_tf_train <- X_tf_idf_full %>%
+  filter(doc_number %in% train_ids_time) %>%
+  arrange(doc_number) %>%
+  select(-doc_number)
+
+X_tf_test <- X_tf_idf_full %>%
+  filter(doc_number %in% test_ids_time) %>%
+  arrange(doc_number) %>%
+  select(-doc_number)
+
+colnames(X_tf_train) <- make.names(colnames(X_tf_train))
+colnames(X_tf_test) <- make.names(colnames(X_tf_test))
+
+tf_trainset <- data.frame(period = y_train_time, X_tf_train)
+tf_test_x <- data.frame(X_tf_test)
+
+pred_cols <- setdiff(names(tf_trainset), "period")
+missing_cols <- setdiff(pred_cols, names(tf_test_x))
+
+if (length(missing_cols) > 0) {
+  tf_test_x[missing_cols] <- 0
+}
+
+tf_test_x <- tf_test_x[, pred_cols, drop = FALSE]
+```
+
+```{r}
+#rf
+set.seed(10)
+
+tf_rf <- randomForest(
+  period ~ .,
+  data = tf_trainset,
+  ntree = 200,
+  mtry = floor(sqrt(ncol(X_tf_train)))
+)
+
+pred_tf_rf <- predict(tf_rf, newdata = tf_test_x)
+cm_time_rf <- confusionMatrix(pred_tf_rf, y_test_time)
+cm_time_rf
+```
+
+```{r}
+#xgboost
+
+y_train_xgb <- factor(y_train_time, levels = c("pre", "post"))
+y_test_xgb <- factor(y_test_time, levels = c("pre", "post"))
+
+xg_train <- as.matrix(X_tf_train)
+xg_test <- as.matrix(X_tf_test)
+
+train_label <- as.integer(y_train_xgb) - 1
+
+tab <- table(y_train_xgb)
+scale_pos <- as.numeric(tab["pre"] / tab["post"])
+
+set.seed(10)
+
+tf_xg <- xgboost(
+  data = xg_train,
+  label = train_label,
+  max.depth = 4,
+  nrounds = 400,
+  eta = 0.2,
+  objective = "binary:logistic",
+  scale_pos_weight = scale_pos,
+  verbose = 0
+)
+
+pred_prob <- predict(tf_xg, xg_test)
+pred_class <- ifelse(pred_prob > 0.5, "post", "pre")
+pred_class <- factor(pred_class, levels = c("pre", "post"))
+
+cm_time_xg <- confusionMatrix(pred_class, y_test_xgb, positive = "post")
+cm_time_xg
+```
+```{r}
+time_results_tbl <- tibble(
+  Representation = c("TF-IDF", "TF-IDF"),
+  Model = c("RF", "XGBoost"),
+  Accuracy = c(
+    cm_time_rf$overall[["Accuracy"]],
+    cm_time_xg$overall[["Accuracy"]]
+  ),
+  Kappa = c(
+    cm_time_rf$overall[["Kappa"]],
+    cm_time_xg$overall[["Kappa"]]
+  )
+) %>%
+  mutate(across(-c(Representation, Model), as.numeric))
+
+time_results_tbl
+
+```
+```{r}
+pred_prob   # predicted probabilities for "post"
+y_test_xgb  # true labels (factor: pre/post)
+
+roc_obj <- roc(
+  response = y_test_xgb,
+  predictor = pred_prob,
+  levels = c("pre", "post"),
+  direction = "<"
+)
+
+# AUC
+auc(roc_obj)
+plot(
+  roc_time,
+  main = "ROC curve: pre- vs post-2015 classification",
+  legacy.axes = TRUE
+
+)
+
+auc_val <- auc(roc_obj)
+
+legend(
+  "bottomright",
+  legend = paste("AUC =", round(auc_val, 3)),
+  bty = "n"
+)
+
+
+```
+
+```{r}
+#association rules for year
+
+time_map <- raw_data %>%
+  select(doc_number, year) %>%
+  distinct() %>%
+  mutate(
+    doc_number = as.integer(doc_number),
+    period = ifelse(year < 2015, "pre", "post"),
+    period = factor(period, levels = c("pre", "post"))
+  )
+
+tokens_time <- raw_data %>%
+  select(doc_number, abstract) %>%
+  mutate(doc_number = as.integer(doc_number)) %>%
+  inner_join(time_map, by = "doc_number") %>%
+  unnest_tokens(word, abstract) %>%
+  anti_join(stop_words, by = "word") %>%
+  filter(!word %in% custom_stop_words) %>%
+  filter(str_detect(word, "^[a-z]+$"))
+
+min_freq_time <- 25
+
+keep_words_time <- tokens_time %>%
+  count(word) %>%
+  filter(n >= min_freq_time) %>%
+  pull(word)
+
+tokens_time <- tokens_time %>%
+  filter(word %in% keep_words_time)
+
+transactions_by_period <- tokens_time %>%
+  group_by(period) %>%
+  group_split() %>%
+  setNames(c("pre", "post")) %>%
+  lapply(function(df) {
+    df %>%
+      distinct(doc_number, word) %>%
+      split(.$doc_number) %>%
+      lapply(function(x) x$word) %>%
+      as("transactions")
+  })
+
+min_support <- 0.01
+min_conf <- 0.4
+
+rules_by_period <- lapply(transactions_by_period, function(tr) {
+  r <- apriori(
+    tr,
+    parameter = list(
+      supp = min_support,
+      conf = min_conf,
+      minlen = 2
+    )
+  )
+  r <- subset(r, lift > 1.0)
+  r <- sort(r, by = "lift", decreasing = TRUE)
+  r
+})
+
+rules_summary_time <- tibble(
+  period = names(rules_by_period),
+  n_rules = sapply(rules_by_period, length)
+)
+
+rules_summary_time
+```
+
+```{r}
+#visualise
+n_rules <- 15
+
+for (p in names(rules_by_period)) {
+  rules_sorted <- rules_by_period[[p]]
+  rules_sub <- rules_sorted[1:min(n_rules, length(rules_sorted))]
+  
+  p1 <- plot(
+    rules_sub,
+    method = "graph",
+    measure = "lift",
+    shading = "confidence",
+    engine = "ggplot2"
+  )
+  
+  print(p1 + ggplot2::ggtitle(paste("Period", p, "- top", n_rules, "rules")))
+}
+```
+```{r}
+#cluster/pca
+
+#setup
+
+doc_meta <- raw_data %>%
+  select(doc_number, year, journal) %>%
+  distinct() %>%
+  mutate(doc_number = as.integer(doc_number))
+
+tidy_all <- raw_data %>%
+  select(doc_number, abstract) %>%
+  mutate(doc_number = as.integer(doc_number)) %>%
+  unnest_tokens(word, abstract) %>%
+  anti_join(stop_words, by = "word") %>%
+  filter(!word %in% custom_stop_words) %>%
+  filter(str_detect(word, "^[a-z]+$")) %>%
+  filter(!str_detect(word, "\\b\\d+\\b"))
+
+max_words <- 1500
+
+selected_words <- tidy_all %>%
+  count(word, sort = TRUE) %>%
+  slice_head(n = max_words) %>%
+  pull(word)
+
+tfidf_long <- tidy_all %>%
+  filter(word %in% selected_words) %>%
+  count(doc_number, word) %>%
+  bind_tf_idf(term = word, document = doc_number, n = n) %>%
+  select(doc_number, word, tf_idf)
+
+doc_ids <- tfidf_long %>%
+  distinct(doc_number) %>%
+  arrange(doc_number) %>%
+  pull(doc_number)
+
+```
+
+```{r}
+#clusters
+X_mat <- tfidf_long %>%
+  pivot_wider(names_from = word, values_from = tf_idf, values_fill = 0) %>%
+  arrange(doc_number) %>%
+  select(-doc_number) %>%
+  as.matrix()
+
+colnames(X_mat) <- make.names(colnames(X_mat))
+d_euc <- dist(X_mat, method = "euclidean")
+hc <- hclust(d_euc, method = "ward.D2")
+
+k_grid <- 2:8
+
+sil_df <- tibble(
+  k = k_grid,
+  avg_sil = sapply(k_grid, function(k) {
+    cl <- cutree(hc, k = k)
+    mean(silhouette(cl, d_euc)[, 3])
+  })
+)
+
+k <- sil_df %>% slice_max(avg_sil, n = 1, with_ties = FALSE) %>% pull(k)
+
+clusters <- cutree(hc, k = k)
+
+cluster_df <- tibble(
+  doc_number = doc_ids,
+  cluster = factor(clusters)
+) %>%
+  left_join(doc_meta, by = "doc_number")
+
+cluster_df %>% count(cluster)
+
+```
+
+```{r}
+# top words per cluster
+
+tfidf_with_cluster <- tfidf_long %>%
+  left_join(cluster_df %>% select(doc_number, cluster), by = "doc_number")
+
+top_terms <- tfidf_with_cluster %>%
+  group_by(cluster, word) %>%
+  summarise(mean_tfidf = mean(tf_idf), .groups = "drop") %>%
+  group_by(cluster) %>%
+  slice_max(mean_tfidf, n = 10, with_ties = FALSE) %>%
+  ungroup()
+
+top_terms %>%
+  ggplot(aes(x = reorder(word, mean_tfidf), y = mean_tfidf)) +
+  geom_col() +
+  coord_flip() +
+  facet_wrap(~ cluster, scales = "free_y") +
+  labs(
+    title = "Top 10 words per cluster (mean TF-IDF)",
+    x = NULL,
+    y = "Mean TF-IDF"
+  ) +
+  theme_minimal()
+
+top_terms
+
+```
+
+```{r}
+# PCA visualisation
+
+pca <- prcomp(X_mat, center = TRUE, scale. = TRUE)
+
+scores <- as_tibble(pca$x[, 1:2])
+colnames(scores) <- c("PC1", "PC2")
+
+scores <- scores %>%
+  mutate(doc_number = doc_ids) %>%
+  left_join(cluster_df, by = "doc_number")
+
+#trimm outliers
+pc1_q <- quantile(scores$PC1, c(0.01, 0.99), na.rm = TRUE)
+pc2_q <- quantile(scores$PC2, c(0.01, 0.99), na.rm = TRUE)
+
+scores_trim <- scores %>%
+  filter(
+    PC1 >= pc1_q[1] & PC1 <= pc1_q[2],
+    PC2 >= pc2_q[1] & PC2 <= pc2_q[2]
+  )
+
+ggplot(scores_trim, aes(PC1, PC2, colour = cluster)) +
+  geom_point(alpha = 0.5, size = 1) +
+  labs(
+    title = "PCA projection of TF-IDF documents (coloured by cluster)",
+    x = "PC1",
+    y = "PC2"
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+#Regression - predict citations
+
+reg_base <- raw_data %>%
+  select(doc_number, journal, year, citations, altmetric, abstract) %>%
+  distinct() %>%
+  mutate(
+    doc_number = as.integer(doc_number),
+    journal = as.factor(journal),
+    year = as.integer(year),
+    citations = as.numeric(citations),
+    altmetric = as.numeric(altmetric),
+    abstract_length = str_count(abstract, "\\w+")
+  ) %>%
+  select(doc_number, journal, year, citations, altmetric, abstract_length)
+
+#topic model
+topic_wide <- abstract_gamma %>%
+  mutate(
+    doc_number = as.integer(document),
+    topic = paste0("topic_", topic)
+  ) %>%
+  select(doc_number, topic, gamma) %>%
+  pivot_wider(names_from = topic, values_from = gamma, values_fill = 0)
+
+#tf-idf summary 
+tidy_reg <- raw_data %>%
+  select(doc_number, abstract) %>%
+  mutate(doc_number = as.integer(doc_number)) %>%
+  unnest_tokens(word, abstract) %>%
+  anti_join(stop_words, by = "word") %>%
+  filter(!word %in% custom_stop_words) %>%
+  filter(str_detect(word, "^[a-z]+$"))
+
+tfidf_total <- tidy_reg %>%
+  count(doc_number, word) %>%
+  bind_tf_idf(term = word, document = doc_number, n = n) %>%
+  group_by(doc_number) %>%
+  summarise(tfidf_total = sum(tf_idf), .groups = "drop")
+
+reg_df <- reg_base %>%
+  left_join(topic_wide, by = "doc_number") %>%
+  left_join(tfidf_total, by = "doc_number") %>%
+  mutate(tfidf_total = replace_na(tfidf_total, 0)) %>%
+  drop_na(citations, altmetric, abstract_length, year, journal)
+
+ggplot(reg_df, aes(citations)) +
+  geom_histogram(bins = 60) +
+  labs(
+    title = "Citation counts",
+    x = "Citations",
+    y = "Count"
+  ) +
+  theme_minimal()
+
+```
+
+
+```{r}
+#regression model
+set.seed(10)
+
+idx <- createDataPartition(reg_df$citations, p = 0.8, list = FALSE)
+
+train_reg <- reg_df[idx, ]
+test_reg  <- reg_df[-idx, ]
+
+lm_cit <- lm(
+  citations ~ abstract_length + year + journal + altmetric + tfidf_total +
+    topic_1 + topic_2 + topic_3 + topic_4 + topic_5,
+  data = train_reg
+)
+
+pred_cit_te <- predict(lm_cit, newdata = test_reg)
+pred_cit_te <- ifelse(pred_cit_te < 0, 0, pred_cit_te)
+
+rmse_cit <- RMSE(pred_cit_te, test_reg$citations)
+r2_cit   <- R2(pred_cit_te, test_reg$citations)
+
+
+rmse_cit
+r2_cit
+
+
+```
+
+```{r}
+#account for skewness
+#log + 1
+
+lm_log <- lm(
+  log(citations + 1) ~ abstract_length + year + journal + altmetric + tfidf_total +
+    topic_1 + topic_2 + topic_3 + topic_4 + topic_5,
+  data = train_reg
+)
+
+pred_log_te <- exp(predict(lm_log, newdata = test_reg)) - 1
+pred_log_te <- ifelse(pred_log_te < 0, 0, pred_log_te)
+
+
+rmse_log <- RMSE(pred_log_te, test_reg$citations)
+r2_log <- R2(pred_log_te, test_reg$citations)
+
+
+rmse_log
+r2_log
+
+```
+
+
+```{r}
+# binary label
+train_bin <- train_reg %>% mutate(cited = factor(ifelse(citations > 0, "Yes", "No")))
+test_bin  <- test_reg  %>% mutate(cited = factor(ifelse(citations > 0, "Yes", "No"),
+                                                 levels = levels(train_bin$cited)))
+
+logit_cited <- glm(
+  cited ~ abstract_length + year + journal + altmetric + tfidf_total +
+    topic_1 + topic_2 + topic_3 + topic_4 + topic_5,
+  data = train_bin,
+  family = binomial
+)
+
+prob_test <- predict(logit_cited, newdata = test_bin, type = "response")
+
+pred_test <- factor(ifelse(prob_test > 0.5, "Yes", "No"), levels = c("No", "Yes"))
+
+confusionMatrix(pred_test, test_bin$cited, positive = "Yes")
+
+
+roc_obj <- roc(test_bin$cited, prob_test, levels = c("No", "Yes"))
+auc(roc_obj)
+plot(
+  roc_obj,
+  xlim = c(1, 0),
+  ylim = c(0, 1),
+  main = "ROC: predicting whether a paper is cited",
+  legacy.axes = TRUE
+)
+
+
+
+```
+
+```{r}
+train_pos <- train_reg %>% filter(citations > 0)
+test_pos  <- test_reg  %>% filter(citations > 0)
+
+lm_pos <- lm(
+  log(citations) ~ abstract_length + year + journal + altmetric + tfidf_total +
+    topic_1 + topic_2 + topic_3 + topic_4 + topic_5,
+  data = train_pos
+)
+
+pred_log <- predict(lm_pos, newdata = test_pos)
+pred_cit <- pmax(0, exp(pred_log))
+
+RMSE(pred_cit, test_pos$citations)
+R2(pred_cit, test_pos$citations)
+mean(abs(pred_cit - test_pos$citations))
+
+```
+
+
